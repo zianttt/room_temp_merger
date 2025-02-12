@@ -6,13 +6,11 @@ from openpyxl.styles import PatternFill
 def process_excel(file, sheet_mapping) -> BytesIO:
     wb = openpyxl.load_workbook(file)
     
-    # Retrieve the sheet names from the mapping
     room_sheet_name = sheet_mapping["Room Data"]
     min_sheet_name = sheet_mapping["Min"]
     max_sheet_name = sheet_mapping["Max"]
     mid_sheet_name = sheet_mapping["Midband"]  # Not used in computation but may be present
 
-    # Check for required sheets in the workbook.
     missing_sheets = []
     for name in [room_sheet_name, min_sheet_name, max_sheet_name]:
         if name not in wb.sheetnames:
@@ -21,7 +19,6 @@ def process_excel(file, sheet_mapping) -> BytesIO:
         st.error("The following required sheets are missing: " + ", ".join(missing_sheets))
         return None
     
-    # Warn if the midband sheet (optional) is missing.
     if mid_sheet_name not in wb.sheetnames:
         st.warning(f"Sheet for 'Midband' mapping ({mid_sheet_name}) not found. It will be ignored.")
     
@@ -29,27 +26,21 @@ def process_excel(file, sheet_mapping) -> BytesIO:
     min_sheet = wb[min_sheet_name]
     max_sheet = wb[max_sheet_name]
 
-    # Remove any existing "Result" sheet to avoid duplicates.
     if "Result" in wb.sheetnames:
         wb.remove(wb["Result"])
     result_sheet = wb.create_sheet("Result")
 
-    # Define fill colors for formatting
     blue_fill = PatternFill(fill_type="solid", start_color="ADD8E6", end_color="ADD8E6")   # blue for low
     green_fill = PatternFill(fill_type="solid", start_color="90EE90", end_color="90EE90")   # green for ok
     red_fill   = PatternFill(fill_type="solid", start_color="FFC7CE", end_color="FFC7CE")   # light red for high
 
-    # Assume that the first 3 rows and first 3 columns are headers.
     max_row = room_data_sheet.max_row
     max_col = room_data_sheet.max_column
 
-    # Process each cell, copying header cells and computing data cells.
     for r in range(1, max_row + 1):
         for c in range(1, max_col + 1):
-            # Read the cell from Room Data.
             room_cell = room_data_sheet.cell(row=r, column=c)
-            # For header cells (first 3 rows or first 3 columns), copy the value.
-            if r <= 3 or c <= 3:
+            if r <= 3 or c <= 2:
                 new_value = room_cell.value
             else:
                 # Get the corresponding values from the Min and Max sheets.
@@ -74,7 +65,7 @@ def process_excel(file, sheet_mapping) -> BytesIO:
             cell = result_sheet.cell(row=r, column=c, value=new_value)
             
             # For data cells (beyond the header area), apply the desired formatting.
-            if r > 3 and c > 3 and isinstance(new_value, str):
+            if r > 3 and c > 2 and isinstance(new_value, str):
                 if new_value.startswith("low:"):
                     cell.fill = blue_fill
                 elif new_value.startswith("high:"):
@@ -90,6 +81,7 @@ def process_excel(file, sheet_mapping) -> BytesIO:
 
 def main():
     st.title("Excel Temperature Checker with Formatting and Sheet Mapping")
+
     st.sidebar.header("Sheet Name Mapping")
     sheet_mapping = {
         "Midband": st.sidebar.text_input("Name for Midband sheet", "Midband"),
