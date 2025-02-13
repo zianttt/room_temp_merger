@@ -1,3 +1,4 @@
+from datetime import datetime
 import streamlit as st
 from io import BytesIO
 import openpyxl
@@ -150,7 +151,6 @@ def process_excel(file) -> BytesIO:
 
 def main():
     st.title("Excel Temperature Checker")
-    
     uploaded_file = st.file_uploader("Upload your Excel (.xlsx) file", type=["xlsx"])
     if uploaded_file:
         processed_file = process_excel(uploaded_file)
@@ -159,7 +159,7 @@ def main():
             st.download_button(
                 label="Download updated Excel file",
                 data=processed_file,
-                file_name="updated_file.xlsx",
+                file_name=f"processed{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
