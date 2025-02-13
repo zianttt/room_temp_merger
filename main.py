@@ -1,13 +1,11 @@
 import streamlit as st
-import pandas as pd
 from io import BytesIO
 import openpyxl
-from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import PatternFill
 
-def auto_detect_sheets_pandas(xls):
+def auto_detect_sheets(wb):
     """
-    Auto-detect sheets by scanning sheet names for keywords.
+    Auto-detect sheets by checking the sheet titles and (if necessary) early cell values.
     Expected roles: 'Max', 'Min', 'Midband', and 'Room Data'
     """
     role_keywords = {
@@ -17,112 +15,133 @@ def auto_detect_sheets_pandas(xls):
         "Room Data": ["sensed value", "room"]
     }
     detected = {role: None for role in role_keywords}
-    for sheet in xls.sheet_names:
-        sheet_lower = sheet.lower()
+    
+    # First pass: check sheet titles
+    for sheet in wb.worksheets:
+        sheet_title_lower = sheet.title.lower()
         for role, keywords in role_keywords.items():
-            if any(keyword in sheet_lower for keyword in keywords):
+            if any(keyword in sheet_title_lower for keyword in keywords):
                 if detected[role] is None:
-                    detected[role] = sheet
+                    detected[role] = sheet.title
+                    
+    # Second pass: if a role is still not detected, check the first 10x10 cells for keywords.
+    for role, value in detected.items():
+        if value is None:
+            for sheet in wb.worksheets:
+                for row in sheet.iter_rows(min_row=1, max_row=10, min_col=1, max_col=10):
+                    for cell in row:
+                        if cell.value and isinstance(cell.value, str):
+                            cell_text = cell.value.lower()
+                            if any(keyword in cell_text for keyword in role_keywords[role]):
+                                detected[role] = sheet.title
+                                break
+                    if detected[role] is not None:
+                        break
+                if detected[role] is not None:
+                    break
     return detected
 
+def detect_data_offset(sheet, header_rows_count=3, header_cols_count=2):
+    data_start_row = None
+    data_start_col = None
+    for r in range(sheet.min_row, sheet.max_row + 1):
+        for c in range(sheet.min_column, sheet.max_column + 1):
+            cell_val = sheet.cell(row=r, column=c).value
+            if isinstance(cell_val, (int, float)):
+                data_start_row = r
+                data_start_col = c
+                break
+        if data_start_row is not None:
+            break
+    # Determine header start boundaries (if data is found)
+    if data_start_row is not None:
+        header_row_start = max(sheet.min_row, data_start_row - header_rows_count)
+        header_col_start = max(sheet.min_column, data_start_col - header_cols_count)
+    else:
+        # Fallback: if no numeric data is found, assume the whole sheet is data.
+        header_row_start = sheet.min_row
+        header_col_start = sheet.min_column
+        data_start_row = sheet.min_row
+        data_start_col = sheet.min_column
+        
+    return header_row_start, header_col_start, data_start_row, data_start_col
+
 def process_excel(file) -> BytesIO:
-    file.seek(0)
-    
-    xls = pd.ExcelFile(file)
-    detected = auto_detect_sheets_pandas(xls)
-    
-    room_sheet = detected.get("Room Data")
-    min_sheet  = detected.get("Min")
-    max_sheet  = detected.get("Max")
-    mid_sheet  = detected.get("Midband")  # Optional
-    
-    missing = []
-    for role, sheet in [("Room Data", room_sheet), ("Min", min_sheet), ("Max", max_sheet)]:
-        if sheet is None:
-            missing.append(role)
-    if missing:
-        st.error("Missing required sheets: " + ", ".join(missing))
-        return None
-    if mid_sheet is None:
-        st.warning("Sheet for 'Midband' not found. It will be ignored.")
-    
-    df_room = pd.read_excel(xls, sheet_name=room_sheet, header=None)
-    df_min  = pd.read_excel(xls, sheet_name=min_sheet,  header=None)
-    df_max  = pd.read_excel(xls, sheet_name=max_sheet,  header=None)
-    
-    df_room = df_room.dropna(axis=0, how="all").reset_index(drop=True)
-    df_room = df_room.dropna(axis=1, how="all").reset_index(drop=True)
-    
-    df_min = df_min.dropna(axis=0, how="all").reset_index(drop=True)
-    df_min = df_min.dropna(axis=1, how="all").reset_index(drop=True)
-    
-    df_max = df_max.dropna(axis=0, how="all").reset_index(drop=True)
-    df_max = df_max.dropna(axis=1, how="all").reset_index(drop=True)
-    
-    # Define header counts: the first few rows/columns are header (unchanged)
-    header_rows_count = 3  # first 3 rows are headers
-    header_cols_count = 2  # first 2 columns are headers
-    
-    # Make a copy for results
-    df_result = df_room.copy()
-    
-    # Process the data region (i.e. rows and columns after the header area)
-    # Note: DataFrame indices are 0-based. So data starts at row index header_rows_count and col index header_cols_count.
-    for i in range(header_rows_count, df_room.shape[0]):
-        for j in range(header_cols_count, df_room.shape[1]):
-            # Make sure corresponding cell exists in Min and Max sheets.
-            if i < df_min.shape[0] and j < df_min.shape[1] and i < df_max.shape[0] and j < df_max.shape[1]:
-                room_val = df_room.iat[i, j]
-                min_val  = df_min.iat[i, j]
-                max_val  = df_max.iat[i, j]
-                try:
-                    room_num = float(room_val)
-                    min_num  = float(min_val)
-                    max_num  = float(max_val)
-                except (TypeError, ValueError):
-                    # If not numeric, leave the original value.
-                    continue
-                
-                if room_num <= min_num:
-                    diff = round(room_num - min_num, 2)
-                    df_result.iat[i, j] = f"low: {diff}"
-                elif room_num >= max_num:
-                    diff = round(room_num - max_num, 2)
-                    df_result.iat[i, j] = f"high: {diff}"
-                else:
-                    df_result.iat[i, j] = "ok"
-    
-    file.seek(0)
     wb = openpyxl.load_workbook(file)
     
+    # Auto-detect sheets based on keywords.
+    detected_mapping = auto_detect_sheets(wb)
+    room_sheet_name = detected_mapping.get("Room Data")
+    min_sheet_name = detected_mapping.get("Min")
+    max_sheet_name = detected_mapping.get("Max")
+    mid_sheet_name = detected_mapping.get("Midband")  # Optional
+    
+    # Verify required sheets.
+    missing_sheets = []
+    for name, sheet in [("Room Data", room_sheet_name), ("Min", min_sheet_name), ("Max", max_sheet_name)]:
+        if sheet is None:
+            missing_sheets.append(name)
+    if missing_sheets:
+        st.error("The following required sheets are missing: " + ", ".join(missing_sheets))
+        return None
+    if mid_sheet_name is None:
+        st.warning("Sheet for 'Midband' not found. It will be ignored.")
+    
+    room_sheet = wb[room_sheet_name]
+    min_sheet = wb[min_sheet_name]
+    max_sheet = wb[max_sheet_name]
+    
+    # Detect offsets (i.e. the first data cell) for each sheet.
+    _, _, room_data_start_row, room_data_start_col = detect_data_offset(room_sheet, header_rows_count=3, header_cols_count=2)
+    _, _, min_data_start_row, min_data_start_col = detect_data_offset(min_sheet, header_rows_count=3, header_cols_count=2)
+    _, _, max_data_start_row, max_data_start_col = detect_data_offset(max_sheet, header_rows_count=3, header_cols_count=2)
+    
     if "Result" in wb.sheetnames:
-        ws_old = wb["Result"]
-        wb.remove(ws_old)
+        wb.remove(wb["Result"])
+    result_sheet = wb.create_sheet("Result")
     
-    ws_result = wb.create_sheet("Result")
-    for r_idx, row in enumerate(dataframe_to_rows(df_result, index=False, header=False), start=1):
-        for c_idx, value in enumerate(row, start=1):
-            ws_result.cell(row=r_idx, column=c_idx, value=value)
+    blue_fill = PatternFill(fill_type="solid", start_color="ADD8E6", end_color="ADD8E6")   # blue for low
+    green_fill = PatternFill(fill_type="solid", start_color="90EE90", end_color="90EE90")   # green for ok
+    red_fill   = PatternFill(fill_type="solid", start_color="FFC7CE", end_color="FFC7CE")   # light red for high
     
-    # formatting
-    blue_fill  = PatternFill(fill_type="solid", start_color="ADD8E6", end_color="ADD8E6")
-    green_fill = PatternFill(fill_type="solid", start_color="90EE90", end_color="90EE90")
-    red_fill   = PatternFill(fill_type="solid", start_color="FFC7CE", end_color="FFC7CE")
-    
-    # Apply formatting to the data region only (cells beyond the header area).
-    # Since we wrote the DataFrame starting at A1, headers occupy the first header_rows_count rows and header_cols_count columns.
-    for row in ws_result.iter_rows(min_row=header_rows_count+1, 
-                                   max_row=ws_result.max_row, 
-                                   min_col=header_cols_count+1, 
-                                   max_col=ws_result.max_column):
-        for cell in row:
-            if isinstance(cell.value, str):
-                if cell.value.startswith("low:"):
-                    cell.fill = blue_fill
-                elif cell.value.startswith("high:"):
-                    cell.fill = red_fill
-                elif cell.value == "ok":
-                    cell.fill = green_fill
+    for r in range(room_sheet.min_row, room_sheet.max_row + 1):
+        for c in range(room_sheet.min_column, room_sheet.max_column + 1):
+            room_cell = room_sheet.cell(row=r, column=c)
+            # if the cell is in the header area (before the detected data start), copy it directly.
+            if r < room_data_start_row or c < room_data_start_col:
+                new_value = room_cell.value
+            else:
+                # calculate corresponding positions in the Min and Max sheets.
+                min_row_index = (r - room_data_start_row) + min_data_start_row
+                min_col_index = (c - room_data_start_col) + min_data_start_col
+                max_row_index = (r - room_data_start_row) + max_data_start_row
+                max_col_index = (c - room_data_start_col) + max_data_start_col
+                
+                room_value = room_cell.value
+                min_value = min_sheet.cell(row=min_row_index, column=min_col_index).value
+                max_value = max_sheet.cell(row=max_row_index, column=max_col_index).value
+                
+                if all(isinstance(val, (int, float)) for val in [room_value, min_value, max_value]):
+                    if room_value <= min_value:
+                        diff = round(room_value - min_value, 2)
+                        new_value = f"low: {diff}"
+                    elif room_value >= max_value:
+                        diff = round(room_value - max_value, 2)
+                        new_value = f"high: {diff}"
+                    else:
+                        new_value = "ok"
+                else:
+                    new_value = room_value
+                    
+            # write and format results
+            result_cell = result_sheet.cell(row=r, column=c, value=new_value)
+            if r >= room_data_start_row and c >= room_data_start_col and isinstance(new_value, str):
+                if new_value.startswith("low:"):
+                    result_cell.fill = blue_fill
+                elif new_value.startswith("high:"):
+                    result_cell.fill = red_fill
+                elif new_value == "ok":
+                    result_cell.fill = green_fill
     
     output = BytesIO()
     wb.save(output)
@@ -130,7 +149,7 @@ def process_excel(file) -> BytesIO:
     return output
 
 def main():
-    st.title("Excel Temperature Checker (Pandas + OpenPyXL)")
+    st.title("Excel Temperature Checker")
     
     uploaded_file = st.file_uploader("Upload your Excel (.xlsx) file", type=["xlsx"])
     if uploaded_file:
