@@ -3,6 +3,7 @@ import streamlit as st
 from io import BytesIO
 import openpyxl
 from openpyxl.styles import PatternFill
+import re
 
 def auto_detect_sheets(wb):
     """
@@ -43,6 +44,9 @@ def auto_detect_sheets(wb):
     return detected
 
 def detect_data_offset(sheet, header_rows_count=3, header_cols_count=2):
+    """
+    Detect the start of numeric data in the sheet. This is used for copying headers.
+    """
     data_start_row = None
     data_start_col = None
     for r in range(sheet.min_row, sheet.max_row + 1):
@@ -54,7 +58,7 @@ def detect_data_offset(sheet, header_rows_count=3, header_cols_count=2):
                 break
         if data_start_row is not None:
             break
-    # Determine header start boundaries (if data is found)
+    # Determine header boundaries (if data is found)
     if data_start_row is not None:
         header_row_start = max(sheet.min_row, data_start_row - header_rows_count)
         header_col_start = max(sheet.min_column, data_start_col - header_cols_count)
@@ -66,6 +70,21 @@ def detect_data_offset(sheet, header_rows_count=3, header_cols_count=2):
         data_start_col = sheet.min_column
         
     return header_row_start, header_col_start, data_start_row, data_start_col
+
+def build_sensor_mapping(sheet, header_row=2):
+    """
+    Build a mapping from sensor ID (e.g., 'OC000011') to column index,
+    based on the header row where sensor IDs are present.
+    """
+    mapping = {}
+    for col in range(sheet.min_column, sheet.max_column + 1):
+        header_val = sheet.cell(row=header_row, column=col).value
+        if header_val and isinstance(header_val, str):
+            match = re.search(r"OC\d+", header_val)
+            if match:
+                sensor_id = match.group()
+                mapping[sensor_id] = col
+    return mapping
 
 def process_excel(file) -> BytesIO:
     wb = openpyxl.load_workbook(file)
@@ -92,49 +111,68 @@ def process_excel(file) -> BytesIO:
     min_sheet = wb[min_sheet_name]
     max_sheet = wb[max_sheet_name]
     
-    # Detect offsets (i.e. the first data cell) for each sheet.
-    _, _, room_data_start_row, room_data_start_col = detect_data_offset(room_sheet, header_rows_count=3, header_cols_count=2)
-    _, _, min_data_start_row, min_data_start_col = detect_data_offset(min_sheet, header_rows_count=3, header_cols_count=2)
-    _, _, max_data_start_row, max_data_start_col = detect_data_offset(max_sheet, header_rows_count=3, header_cols_count=2)
+    # Build sensor mappings using the header row where sensor IDs exist (assuming row 2)
+    room_mapping = build_sensor_mapping(room_sheet, header_row=2)
+    min_mapping  = build_sensor_mapping(min_sheet, header_row=2)
+    max_mapping  = build_sensor_mapping(max_sheet, header_row=2)
     
+    # Detect the starting row for data in the Room sheet (headers will be copied directly)
+    _, _, room_data_start_row, room_data_start_col = detect_data_offset(room_sheet, header_rows_count=3, header_cols_count=2)
+    
+    # Remove existing "Result" sheet if it exists and create a new one.
     if "Result" in wb.sheetnames:
         wb.remove(wb["Result"])
     result_sheet = wb.create_sheet("Result")
     
+    # Define cell fills for formatting.
     blue_fill = PatternFill(fill_type="solid", start_color="ADD8E6", end_color="ADD8E6")   # blue for low
     green_fill = PatternFill(fill_type="solid", start_color="90EE90", end_color="90EE90")   # green for ok
     red_fill   = PatternFill(fill_type="solid", start_color="FFC7CE", end_color="FFC7CE")   # light red for high
     
+    # Process each cell in the Room sheet.
     for r in range(room_sheet.min_row, room_sheet.max_row + 1):
         for c in range(room_sheet.min_column, room_sheet.max_column + 1):
             room_cell = room_sheet.cell(row=r, column=c)
-            # if the cell is in the header area (before the detected data start), copy it directly.
+            # For header areas (before data), simply copy the value.
             if r < room_data_start_row or c < room_data_start_col:
                 new_value = room_cell.value
             else:
-                # calculate corresponding positions in the Min and Max sheets.
-                min_row_index = (r - room_data_start_row) + min_data_start_row
-                min_col_index = (c - room_data_start_col) + min_data_start_col
-                max_row_index = (r - room_data_start_row) + max_data_start_row
-                max_col_index = (c - room_data_start_col) + max_data_start_col
+                # Use the header row (assumed row 2) to identify the sensor ID.
+                header_val = room_sheet.cell(row=2, column=c).value
+                sensor_id = None
+                if header_val and isinstance(header_val, str):
+                    match = re.search(r"OC\d+", header_val)
+                    if match:
+                        sensor_id = match.group()
                 
-                room_value = room_cell.value
-                min_value = min_sheet.cell(row=min_row_index, column=min_col_index).value
-                max_value = max_sheet.cell(row=max_row_index, column=max_col_index).value
-                
-                if all(isinstance(val, (int, float)) for val in [room_value, min_value, max_value]):
-                    if room_value <= min_value:
-                        diff = round(room_value - min_value, 2)
-                        new_value = f"low: {diff}"
-                    elif room_value >= max_value:
-                        diff = round(room_value - max_value, 2)
-                        new_value = f"high: {diff}"
+                if sensor_id:
+                    # Get corresponding column indexes from Min and Max sheets.
+                    min_col = min_mapping.get(sensor_id)
+                    max_col = max_mapping.get(sensor_id)
+                    room_value = room_sheet.cell(row=r, column=c).value
+                    if min_col and max_col:
+                        # Assuming the data rows are aligned across sheets.
+                        min_value = min_sheet.cell(row=r, column=min_col).value
+                        max_value = max_sheet.cell(row=r, column=max_col).value
+                        
+                        if all(isinstance(val, (int, float)) for val in [room_value, min_value, max_value]):
+                            if room_value <= min_value:
+                                diff = round(room_value - min_value, 2)
+                                new_value = f"low: {diff}"
+                            elif room_value >= max_value:
+                                diff = round(room_value - max_value, 2)
+                                new_value = f"high: {diff}"
+                            else:
+                                new_value = "ok"
+                        else:
+                            new_value = room_value
                     else:
-                        new_value = "ok"
+                        # If sensor mapping is missing in one of the sheets, fall back to room value.
+                        new_value = room_value
                 else:
-                    new_value = room_value
-                    
-            # write and format results
+                    new_value = room_cell.value
+            
+            # Write the computed value to the Result sheet.
             result_cell = result_sheet.cell(row=r, column=c, value=new_value)
             if r >= room_data_start_row and c >= room_data_start_col and isinstance(new_value, str):
                 if new_value.startswith("low:"):
@@ -159,7 +197,7 @@ def main():
             st.download_button(
                 label="Download updated Excel file",
                 data=processed_file,
-                file_name=f"processed{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx",
+                file_name=f"processed_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
